@@ -1,0 +1,249 @@
+/**
+ * Nudge Extension
+ *
+ * When the agent finishes a turn, examines the conversation to detect if it
+ * deferred work the user wanted done. If so, sends a specific nudge message
+ * telling it exactly what to continue with.
+ *
+ * The nudge agent sees the full conversation and produces either a classification
+ * (DONE, VALID-PAUSE) or a specific nudge message describing what was deferred.
+ */
+
+import { complete, type Api, type Model, type UserMessage, type AssistantMessage } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+
+const HAIKU_MODEL_ID = "claude-haiku-4-5";
+
+const NUDGE_SYSTEM_PROMPT = `You monitor a coding agent conversation to detect when the agent defers work the user wanted done.
+
+Given the full conversation, respond with exactly one of these formats:
+
+DONE
+Use when: The assistant genuinely completed all requested work. Nothing remains. Summaries of completed work count as DONE.
+
+VALID-PAUSE
+Use when: The assistant stopped because it needs user input — clarification, a choice between options, confirmation of a plan, credentials, etc. It literally cannot proceed without the user.
+
+NUDGE: <specific instruction>
+Use when: The assistant avoided, deferred, or left incomplete work that the user asked it to do. After "NUDGE: ", write a short, specific instruction telling the agent exactly what deferred work to continue with. Reference the specific items/tasks that were skipped.
+
+Examples of NUDGE responses:
+- NUDGE: You listed the VDSO implementation as "future work" but I asked you to implement it. Go ahead and implement it now.
+- NUDGE: You identified 3 failing tests but stopped instead of fixing them. Fix the failing tests.
+- NUDGE: You said "let me know if you want me to proceed" with the cache keying changes — yes, proceed with implementing them.
+- NUDGE: You categorized path validation and stale file deletion as "deferred" but I didn't ask to defer those. Implement them now.
+- NUDGE: You provided code snippets for me to apply manually. Use your tools to make the changes directly.
+
+Rules:
+- Only NUDGE when the user's request clearly included the deferred work.
+- If the user asked for a plan/analysis/review, a plan/analysis/review is DONE, not a nudge.
+- If the assistant asks "Want me to proceed?" or "Should I implement this?", that's a NUDGE — just say yes and be specific about what to proceed with.
+- Completed work summarized in past tense is DONE, even if it lists many items.
+- When in doubt, prefer DONE over NUDGE.
+- NEVER instruct the agent to take actions on behalf of the user (creating PRs, pushing, deploying, publishing, etc.) unless the user explicitly asked for those actions earlier in the conversation.
+- The nudge should only tell the agent to continue with *code/implementation work* that was deferred.
+- Your response MUST start with exactly one of: "DONE", "VALID-PAUSE", or "NUDGE: ". Nothing else. No analysis, no explanation, no preamble.
+- If the work is done, just say "DONE". Do NOT start with "NUDGE:" and then explain why the work is actually complete — that sends a confusing message to the agent.
+`;
+
+async function selectClassifierModel(
+	ctx: ExtensionContext,
+): Promise<{ model: Model<Api>; apiKey: string } | null> {
+	if (!ctx.model) return null;
+
+	if (ctx.model.provider === "anthropic") {
+		const haikuModel = ctx.modelRegistry.find("anthropic", HAIKU_MODEL_ID);
+		if (haikuModel) {
+			const apiKey = await ctx.modelRegistry.getApiKey(haikuModel);
+			if (apiKey) return { model: haikuModel, apiKey };
+		}
+	}
+
+	const apiKey = await ctx.modelRegistry.getApiKey(ctx.model);
+	if (!apiKey) return null;
+	return { model: ctx.model, apiKey };
+}
+
+function extractAssistantText(message: AssistantMessage): string {
+	return message.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join("\n")
+		.trim();
+}
+
+function getLastAssistantMessage(
+	messages: Array<{ role?: string }>,
+): AssistantMessage | null {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i]?.role === "assistant") return messages[i] as AssistantMessage;
+	}
+	return null;
+}
+
+/**
+ * Build the full conversation context from session branch entries.
+ * Includes user messages, assistant text, and tool call summaries.
+ */
+function buildFullContext(ctx: ExtensionContext): string {
+	const parts: string[] = [];
+	const entries = ctx.sessionManager.getBranch();
+
+	for (const entry of entries) {
+		const e = entry as {
+			type: string;
+			message?: {
+				role?: string;
+				content?: unknown;
+				toolName?: string;
+				isError?: boolean;
+			};
+			customType?: string;
+			content?: unknown;
+		};
+
+		if (e.type !== "message" || !e.message) continue;
+		const msg = e.message;
+
+		if (msg.role === "user") {
+			const content = msg.content;
+			let text = "";
+			if (typeof content === "string") {
+				text = content;
+			} else if (Array.isArray(content)) {
+				text = (content as Array<{ type: string; text?: string }>)
+					.filter((c) => c.type === "text")
+					.map((c) => c.text ?? "")
+					.join("\n");
+			}
+			if (text.trim()) {
+				parts.push(`[USER]: ${text.trim()}`);
+			}
+		} else if (msg.role === "assistant") {
+			const text = extractAssistantText(msg as AssistantMessage);
+			if (text) {
+				parts.push(`[ASSISTANT]: ${text}`);
+			}
+			// Summarize tool calls
+			const content = msg.content;
+			if (Array.isArray(content)) {
+				const tools = (content as Array<{ type: string; name?: string }>)
+					.filter((c) => c.type === "toolCall" && c.name)
+					.map((c) => c.name);
+				if (tools.length > 0) {
+					parts.push(`[TOOLS CALLED]: ${tools.join(", ")}`);
+				}
+			}
+		} else if (msg.role === "toolResult" && msg.toolName) {
+			const status = msg.isError ? "failed" : "ok";
+			parts.push(`[TOOL RESULT: ${msg.toolName} — ${status}]`);
+		}
+	}
+
+	return parts.join("\n\n");
+}
+
+type NudgeResult =
+	| { action: "none" }
+	| { action: "nudge"; message: string };
+
+async function evaluateConversation(
+	ctx: ExtensionContext,
+): Promise<NudgeResult> {
+	const selection = await selectClassifierModel(ctx);
+	if (!selection) return { action: "none" };
+
+	const conversationContext = buildFullContext(ctx);
+	if (!conversationContext) return { action: "none" };
+
+	const userMessage: UserMessage = {
+		role: "user",
+		content: [{ type: "text", text: conversationContext }],
+		timestamp: Date.now(),
+	};
+
+	try {
+		const response = await complete(
+			selection.model,
+			{ systemPrompt: NUDGE_SYSTEM_PROMPT, messages: [userMessage] },
+			{ apiKey: selection.apiKey },
+		);
+
+		if (response.stopReason === "aborted" || response.stopReason === "error") {
+			return { action: "none" };
+		}
+
+		const result = response.content
+			.filter((c): c is { type: "text"; text: string } => c.type === "text")
+			.map((c) => c.text)
+			.join(" ")
+			.trim();
+
+		if (result.toUpperCase().startsWith("NUDGE:")) {
+			const message = result.slice("NUDGE:".length).trim();
+			if (message) {
+				return { action: "nudge", message };
+			}
+		}
+
+		return { action: "none" };
+	} catch {
+		return { action: "none" };
+	}
+}
+
+const MAX_NUDGES = 2;
+
+export default function nudgeExtension(pi: ExtensionAPI): void {
+	let enabled = true;
+	let nudgeCount = 0;
+
+	pi.registerCommand("nudge", {
+		description: "Toggle the nudge extension on/off",
+		handler: async (_args, ctx) => {
+			enabled = !enabled;
+			ctx.ui.notify(`Nudge ${enabled ? "enabled" : "disabled"}`, "info");
+		},
+	});
+
+	pi.on("input", async () => {
+		nudgeCount = 0;
+		return { action: "continue" as const };
+	});
+
+	pi.on("agent_end", async (event, ctx) => {
+		if (!enabled) return;
+
+		const lastAssistant = getLastAssistantMessage(event.messages);
+		if (!lastAssistant) return;
+
+		if (lastAssistant.stopReason === "aborted") return;
+
+		const text = extractAssistantText(lastAssistant);
+		if (!text) return;
+
+		if (ctx.hasPendingMessages()) return;
+		if (nudgeCount >= MAX_NUDGES) return;
+
+		const result = await evaluateConversation(ctx);
+
+		// Re-check: user may have sent a new message while we were evaluating
+		if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+
+		if (result.action === "nudge") {
+			nudgeCount++;
+			ctx.ui.notify(`Nudge: ${result.message.slice(0, 80)}...`, "info");
+			pi.sendMessage(
+				{
+					customType: "nudge",
+					content: result.message,
+					display: true,
+				},
+				{
+					deliverAs: "followUp",
+					triggerTurn: true,
+				},
+			);
+		}
+	});
+}
