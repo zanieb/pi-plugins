@@ -13,13 +13,32 @@ const BLOCKED_ACTIONS = new Set(["eval"]);
 
 const TOOL_DESCRIPTION = `Browser automation via trusted agent-browser CLI (vercel-labs/agent-browser).
 
+WHEN TO USE: This tool is for visually inspecting websites (verifying UI/layout changes,
+taking screenshots, checking visual state) and retrieving rendered web content when no
+better tool exists. Prefer domain-specific CLIs and curl over the browser:
+- GitHub (issues, PRs, repos, code, actions): use the \`gh\` CLI instead
+- REST APIs and raw data fetching: use \`curl\` instead
+- Only use the browser when you need to SEE the page or interact with a web UI
+
 Safety defaults:
 - No automatic npm installs
 - Blocks unsafe subcommands (currently: eval) unless allowUnsafe=true
 - Returns structured JSON output when available
 
 Workflow:
-open <url> -> snapshot -i -> interact (@e refs) -> re-snapshot -> screenshot -> close`;
+open <url> -> snapshot -i -> interact (@e refs) -> re-snapshot -> screenshot -> close
+
+Key commands beyond the basics:
+- set viewport <w> <h> — resize viewport
+- set device "<name>" — emulate device (e.g. "iPhone 15 Pro")
+- set media [dark|light] — emulate color scheme
+- screenshot --annotate — numbered labels on interactive elements
+- wait --load networkidle — wait for page to finish loading
+- get text/html/value/url/title <sel> — extract info
+- diff snapshot/screenshot — compare states
+- eval <js> — run JavaScript (requires allowUnsafe=true)
+
+Load the agent-browser skill for the full command reference.`;
 
 function splitCommand(input: string): string[] {
 	const matches = input.match(/(?:[^\s"']+|"(?:\\.|[^"])*"|'(?:\\.|[^'])*')+/g) ?? [];
